@@ -2,12 +2,18 @@
 
 ## Executive Summary
 
-This document outlines the comprehensive plan for implementing multi-user support in Suwayomi-Server, including per-user bookmarks, subscriptions, and library management while maintaining backward compatibility with the existing shared/public library for anonymous users.
+This document outlines a simplified, focused plan for implementing multi-user support in Suwayomi-Server, enabling per-user bookmarks, subscriptions, and library management. The design prioritizes minimal modifications to the existing system while providing essential multi-user functionality.
 
 **Last Updated:** 2024-10-08  
 **Status:** Planning Phase  
 **Priority:** High  
 **Related Issues:** #623
+
+**Scope:**
+- Multi-user support with authenticated users only
+- Per-user libraries, bookmarks, and reading progress
+- Simplified migration from single-user to multi-user mode
+- No anonymous/public library access (users must authenticate)
 
 ---
 
@@ -20,14 +26,11 @@ This document outlines the comprehensive plan for implementing multi-user suppor
 5. [Database Schema Changes](#5-database-schema-changes)
 6. [Authentication & Authorization](#6-authentication--authorization)
 7. [API Changes](#7-api-changes)
-8. [Backward Compatibility Strategy](#8-backward-compatibility-strategy)
+8. [Migration Strategy](#8-migration-strategy)
 9. [Implementation Phases](#9-implementation-phases)
-10. [Migration Strategy](#10-migration-strategy)
-11. [Testing Strategy](#11-testing-strategy)
-12. [Performance Considerations](#12-performance-considerations)
-13. [Security Considerations](#13-security-considerations)
-14. [Future Enhancements](#14-future-enhancements)
-15. [Open Questions](#15-open-questions)
+10. [Testing Strategy](#10-testing-strategy)
+11. [Security Considerations](#11-security-considerations)
+12. [Open Questions](#12-open-questions)
 
 ---
 
@@ -119,25 +122,18 @@ Current endpoints (from `MangaController.kt`):
 
 ### 3.1 Primary Goals
 
-1. **User Isolation:** Each user has their own library, bookmarks, categories, and reading progress
-2. **Backward Compatibility:** Existing single-user installations continue to work seamlessly
-3. **Anonymous Access:** Support for public/shared libraries for unauthenticated users
-4. **Migration Path:** Clear upgrade path from single-user to multi-user mode
-5. **Performance:** Minimal performance impact for single-user deployments
+1. **User Isolation:** Each authenticated user has their own library, bookmarks, categories, and reading progress
+2. **Minimal Changes:** Reuse existing authentication infrastructure with minimal modifications
+3. **Simple Migration:** Clear upgrade path from single-user to multi-user mode
+4. **Essential Features:** Focus on core multi-user functionality without complex edge cases
 
-### 3.2 Secondary Goals
+### 3.2 Non-Goals
 
-1. **User Management:** Admin interface for creating/managing users
-2. **Permission System:** Role-based access control (Admin, User, Guest)
-3. **Shared Resources:** Ability to share manga/categories between users
-4. **Data Privacy:** User data isolation and privacy controls
-
-### 3.3 Non-Goals (Future Enhancements)
-
-1. Full OAuth2/SAML integration (keep for future)
-2. Advanced permission granularity (keep simple initially)
-3. User groups/teams
+1. Anonymous/public library access (users must authenticate)
+2. Complex backward compatibility modes
+3. Advanced permission granularity (keep simple initially)
 4. Social features (sharing, recommendations)
+5. OAuth2/SAML integration (use existing auth modes)
 
 ---
 
@@ -153,27 +149,24 @@ object UserTable : IntIdTable() {
     val username = varchar("username", 128).uniqueIndex()
     val passwordHash = varchar("password_hash", 256).nullable()
     val email = varchar("email", 256).nullable()
-    val role = varchar("role", 32).default("USER") // ADMIN, USER, GUEST
+    val role = varchar("role", 32).default("USER") // ADMIN, USER
     val isActive = bool("is_active").default(true)
     val createdAt = long("created_at")
     val lastLoginAt = long("last_login_at").default(0)
-    val settings = text("settings").default("{}") // JSON for user preferences
 }
 ```
 
-**User Types:**
+**User Roles:**
 - `ADMIN` - Full system access, can manage users
 - `USER` - Regular user with own library
-- `GUEST` - Read-only access to shared library
 
-**Anonymous/Shared Library User:**
-- Special user with ID = 0 or username = "anonymous"
-- Used for backward compatibility and public access
-- When auth mode is NONE, all requests use anonymous user
+**First User Setup:**
+- First user created during initial setup is automatically set as ADMIN
+- Subsequent users created by admin
 
 ### 4.2 Library Ownership Model
 
-**Option A: User-Scoped Library (Recommended)**
+**User-Scoped Library:**
 
 Each user has their own library entries. Manga can be in multiple users' libraries independently.
 
@@ -182,7 +175,6 @@ object UserMangaLibraryTable : IntIdTable() {
     val user = reference("user_id", UserTable)
     val manga = reference("manga_id", MangaTable)
     val addedAt = long("added_at")
-    val customTitle = varchar("custom_title", 512).nullable()
     val isFavorite = bool("is_favorite").default(false)
     
     init {
@@ -191,20 +183,11 @@ object UserMangaLibraryTable : IntIdTable() {
 }
 ```
 
-**Pros:**
-- Clear ownership
-- Easy to implement
+**Benefits:**
+- Clear ownership per user
 - Simple queries
 - Natural data isolation
-
-**Cons:**
-- Potential data duplication (minimal - just relationships)
-
-**Option B: Shared Library with Access Control**
-
-Single library with user access permissions.
-
-**Decision:** Choose Option A for clarity and simplicity.
+- Easy to implement
 
 ### 4.3 Reading Progress Isolation
 
@@ -233,7 +216,7 @@ object UserChapterTable : IntIdTable() {
 
 ```kotlin
 object CategoryTable : IntIdTable() {
-    val user = reference("user_id", UserTable).nullable() // null = global/anonymous
+    val user = reference("user_id", UserTable)
     val name = varchar("name", 64)
     val order = integer("sort_order").default(0)
     val isDefault = bool("is_default").default(false)
@@ -241,8 +224,7 @@ object CategoryTable : IntIdTable() {
     val includeInDownload = integer("include_in_download").default(0)
     
     init {
-        // Ensure unique category names per user
-        uniqueIndex(user, name)
+        uniqueIndex(user, name) // Unique category names per user
     }
 }
 ```
@@ -293,10 +275,10 @@ object TrackRecordTable : IntIdTable() {
 
 ### 5.2 Modified Tables
 
-1. **CategoryTable** - Add `user_id` foreign key (nullable for backward compatibility)
+1. **CategoryTable** - Add `user_id` foreign key (required, not nullable)
 2. **TrackRecordTable** - Add `user_id` foreign key
-3. **ChapterTable** - Deprecate user-specific fields (keep for migration)
-4. **MangaTable** - Deprecate `inLibrary` field (keep for migration)
+3. **ChapterTable** - Keep as-is; user-specific data moves to UserChapterTable
+4. **MangaTable** - Keep as-is; library status moves to UserMangaLibraryTable
 
 ### 5.3 Migration Tables
 
@@ -341,34 +323,33 @@ object MigrationBackupTable : Table() {
 
 1. **Library Operations:**
    - Users can only access their own library
-   - Admins can access all libraries (for management)
-   - Guests can access anonymous/shared library (read-only)
+   - Admins can access all libraries for management purposes
 
 2. **Manga Operations:**
-   - Read access: All users (manga metadata is public)
+   - Read access: All authenticated users (manga metadata is public)
    - Library add/remove: Owner only
-   - Chapter read/bookmark: Owner only
 
-3. **Category Operations:**
+3. **Chapter Operations:**
+   - Read/bookmark: Owner only
+
+4. **Category Operations:**
    - CRUD: Owner only
-   - View: Owner only (categories are private)
+   - Categories are private to each user
 
-4. **Administrative Operations:**
+5. **Administrative Operations:**
    - User management: Admins only
-   - Extension management: Admins only
-   - Source configuration: Admins only
+   - Extension management: All authenticated users
+   - Source configuration: All authenticated users
 
 ### 6.3 Permission Checks
 
-**Enhanced UserType:**
+**Simplified UserType:**
 
 ```kotlin
 sealed class UserType {
     data class Admin(val id: Int, val username: String) : UserType()
     data class User(val id: Int, val username: String) : UserType()
-    data class Guest(val id: Int) : UserType() // Read-only access
     data object Visitor : UserType() // Not authenticated
-    data object Anonymous : UserType() // Public/shared library access
 }
 
 fun UserType.requireAdmin(): Int {
@@ -390,7 +371,6 @@ fun UserType.canAccessLibrary(userId: Int): Boolean {
     return when (this) {
         is UserType.Admin -> true // Admins can access all
         is UserType.User -> this.id == userId
-        is UserType.Guest -> userId == 0 // Only anonymous library
         else -> false
     }
 }
@@ -400,26 +380,27 @@ fun UserType.canAccessLibrary(userId: Int): Boolean {
 
 ## 7. API Changes
 
-### 7.1 Backward Compatible Endpoints
+### 7.1 API Behavior
 
-**Existing endpoints remain unchanged in behavior:**
-- When auth mode is NONE, all operations use anonymous user (ID=0)
-- When auth mode requires auth, operations use authenticated user's ID
-- Default user ID in multi-user mode: authenticated user's actual ID
+**Endpoint Authentication:**
+- All library/reading progress endpoints require authentication
+- Manga metadata endpoints (browse, search) available to authenticated users
+- No anonymous/public access
 
 **Examples:**
 
 ```
 GET /api/v1/manga/{mangaId}
-- No changes - manga metadata is public
+- Requires authentication
+- Returns manga metadata
 
 POST /api/v1/manga/{mangaId}/library
-- Before: Adds to global library
-- After: Adds to authenticated user's library (or anonymous if no auth)
+- Requires authentication
+- Adds to authenticated user's library
 
 GET /api/v1/library
-- Before: Returns global library
-- After: Returns authenticated user's library
+- Requires authentication
+- Returns authenticated user's library
 ```
 
 ### 7.2 New Multi-User Endpoints
@@ -556,70 +537,106 @@ type Mutation {
 
 ---
 
-## 8. Backward Compatibility Strategy
+## 8. Migration Strategy
 
-### 8.1 Anonymous/Shared Library Support
+### 8.1 Migration from Single-User to Multi-User
 
-**Default User (ID=0):**
-- Username: `"anonymous"` or `"shared"`
-- All operations in NONE auth mode use this user
-- Existing data migrated to this user during upgrade
-- Available for public access even in multi-user mode
+**Approach:** Simple migration where existing data is assigned to the first admin user created.
 
-### 8.2 Migration from Single-User to Multi-User
+**Step 1: First-Time Setup**
+1. On first launch after upgrade, prompt for admin user creation
+2. Create admin user account
+3. Migrate all existing data to this admin user
 
-**Phase 1: Database Schema Update**
-1. Create new tables (User, UserMangaLibrary, UserChapter, etc.)
-2. Add foreign key columns to existing tables (nullable initially)
-3. Create default "anonymous" user (ID=0)
-
-**Phase 2: Data Migration**
-1. Migrate all existing library entries to anonymous user
-2. Migrate all reading progress to anonymous user
-3. Migrate all categories to anonymous user
-4. Update foreign key references
-
-**Phase 3: Application Update**
-1. Update business logic to use user context
-2. Maintain fallback to user ID=0 when not authenticated
-3. Update API endpoints to be user-aware
-
-**Phase 4: Cleanup (Optional)**
-1. Remove deprecated fields from old tables
-2. Make foreign keys non-nullable (after migration complete)
-
-### 8.3 Configuration Options
-
-**New Server Config:**
-
-```kotlin
-// In ServerConfig
-val multiUserEnabled = BooleanProperty(
-    "server.multiUser.enabled",
-    false
-)
-
-val defaultUserEnabled = BooleanProperty(
-    "server.multiUser.allowAnonymous",
-    true
-)
-
-val requireAuthForReading = BooleanProperty(
-    "server.multiUser.requireAuthForReading",
-    false
-)
+**Step 2: Database Schema Update**
+```sql
+-- M00XX_AddUserTable.kt
+CREATE TABLE User (
+    id INTEGER PRIMARY KEY,
+    username VARCHAR(128) UNIQUE NOT NULL,
+    password_hash VARCHAR(256) NOT NULL,
+    role VARCHAR(32) DEFAULT 'USER',
+    is_active BOOLEAN DEFAULT true,
+    created_at BIGINT NOT NULL,
+    last_login_at BIGINT DEFAULT 0
+);
 ```
 
-**Behavior:**
-- `multiUserEnabled = false`: Legacy mode, everything uses user ID=1
-- `multiUserEnabled = true, allowAnonymous = true`: Multi-user mode with shared library
-- `multiUserEnabled = true, allowAnonymous = false`: Strict multi-user mode
+**Step 3: Create User-Scoped Tables**
+```sql
+-- M00XX_AddUserMangaLibrary.kt
+CREATE TABLE UserMangaLibrary (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES User(id),
+    manga_id INTEGER NOT NULL REFERENCES Manga(id),
+    added_at BIGINT NOT NULL,
+    is_favorite BOOLEAN DEFAULT false,
+    UNIQUE(user_id, manga_id)
+);
+
+-- M00XX_AddUserChapter.kt
+CREATE TABLE UserChapter (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES User(id),
+    chapter_id INTEGER NOT NULL REFERENCES Chapter(id),
+    is_read BOOLEAN DEFAULT false,
+    is_bookmarked BOOLEAN DEFAULT false,
+    last_page_read INTEGER DEFAULT 0,
+    last_read_at BIGINT DEFAULT 0,
+    UNIQUE(user_id, chapter_id)
+);
+```
+
+**Step 4: Migrate Existing Data**
+```sql
+-- After admin user is created (e.g., ID=1)
+-- M00XX_MigrateLibraryToUserLibrary.kt
+INSERT INTO UserMangaLibrary (user_id, manga_id, added_at)
+SELECT 1, id, in_library_at
+FROM Manga
+WHERE in_library = true;
+
+-- M00XX_MigrateChapterProgress.kt
+INSERT INTO UserChapter (user_id, chapter_id, is_read, is_bookmarked, last_page_read, last_read_at)
+SELECT 1, id, read, bookmark, last_page_read, last_read_at
+FROM Chapter
+WHERE read = true OR bookmark = true OR last_page_read > 0;
+```
+
+**Step 5: Update Categories**
+```sql
+-- M00XX_AddUserToCategory.kt
+ALTER TABLE Category ADD COLUMN user_id INTEGER REFERENCES User(id);
+UPDATE Category SET user_id = 1; -- Assign to first admin user
+ALTER TABLE Category ALTER COLUMN user_id SET NOT NULL;
+```
+
+### 8.2 Migration UI Flow
+
+1. **Server Upgrade Detection:**
+   - Server detects it needs multi-user migration
+   - Locks down access except for migration endpoint
+
+2. **Admin Setup Screen:**
+   - Prompt for username, password, email (optional)
+   - Create first admin user
+   - Trigger data migration
+
+3. **Migration Execution:**
+   - Run database migrations
+   - Migrate existing data to admin user
+   - Complete setup
+
+4. **Post-Migration:**
+   - Server resumes normal operation
+   - Admin can create additional users
+   - All existing data preserved under admin user's account
 
 ---
 
 ## 9. Implementation Phases
 
-### Phase 1: Foundation (4-6 weeks)
+### Phase 1: Foundation (3-4 weeks)
 
 **Goals:**
 - Database schema changes
@@ -633,15 +650,17 @@ val requireAuthForReading = BooleanProperty(
 4. Implement User management business logic
 5. Update authentication to support real user IDs
 6. Create admin API for user CRUD operations
-7. Write unit tests for user management
+7. Create first-time setup flow
+8. Write unit tests for user management
 
 **Deliverables:**
 - User table and management
 - API endpoints for user CRUD
 - Migration scripts
+- First-time setup UI/flow
 - Unit tests
 
-### Phase 2: Library Isolation (4-6 weeks)
+### Phase 2: Library Isolation (3-4 weeks)
 
 **Goals:**
 - Per-user library support
@@ -662,235 +681,54 @@ val requireAuthForReading = BooleanProperty(
 - Updated API endpoints
 - Integration tests
 
-### Phase 3: Reading Progress Isolation (3-4 weeks)
+### Phase 3: Reading Progress & Categories (3-4 weeks)
 
 **Goals:**
 - Per-user reading progress
+- Per-user categories
 - Chapter bookmark isolation
-- Progress tracking
 
 **Tasks:**
 1. Update Chapter.kt to be user-aware
 2. Update ChapterController endpoints
-3. Implement data migration for reading progress
-4. Update UI clients (documentation)
-5. Add tests for reading progress isolation
+3. Update Category.kt to be user-aware
+4. Update category management endpoints
+5. Implement data migration for reading progress and categories
+6. Add tests for isolation
 
 **Deliverables:**
-- User-scoped reading progress
-- Updated chapter APIs
+- User-scoped reading progress and categories
+- Updated APIs
 - Migration scripts
 - Tests
 
-### Phase 4: Categories & Organization (3-4 weeks)
-
-**Goals:**
-- Per-user categories
-- Category management
-- Manga categorization
-
-**Tasks:**
-1. Update Category.kt to be user-aware
-2. Update category management endpoints
-3. Implement category data migration
-4. Update GraphQL mutations
-5. Add category isolation tests
-
-**Deliverables:**
-- User-scoped categories
-- Updated category APIs
-- Migration scripts
-- Tests
-
-### Phase 5: Tracking & External Services (2-3 weeks)
+### Phase 4: Tracking & Polish (2-3 weeks)
 
 **Goals:**
 - Per-user tracking
-- External service integration isolation
+- Documentation
+- Production readiness
 
 **Tasks:**
 1. Update TrackRecord to be user-aware
 2. Update tracking controllers
 3. Migrate existing tracking data
-4. Test with AniList, MAL, etc.
-5. Update documentation
+4. Security audit
+5. Update user documentation
+6. Create migration guide
+7. Beta testing
 
 **Deliverables:**
 - User-scoped tracking
-- Updated tracking APIs
-- Tests with external services
-
-### Phase 6: Polish & Production (2-3 weeks)
-
-**Goals:**
-- Performance optimization
-- Documentation
-- Production readiness
-
-**Tasks:**
-1. Performance testing and optimization
-2. Security audit
-3. Update user documentation
-4. Update API documentation
-5. Create migration guide
-6. Beta testing period
-
-**Deliverables:**
-- Performance benchmarks
 - Complete documentation
 - Migration guide
 - Production-ready release
 
-**Total Estimated Time: 18-26 weeks (4.5-6.5 months)**
+**Total Estimated Time: 11-15 weeks (2.5-3.5 months)**
 
 ---
 
-## 10. Migration Strategy
-
-### 10.1 Database Migration Approach
-
-**Strategy: Progressive Migration with Rollback Support**
-
-1. **Non-Destructive Migrations:**
-   - Add new tables/columns without removing old ones
-   - Keep old data intact during migration
-   - Use feature flags to toggle new behavior
-
-2. **Data Migration Steps:**
-
-**Step 1: Schema Addition**
-```sql
--- M00XX_AddUserTable.kt
-CREATE TABLE User (
-    id INTEGER PRIMARY KEY,
-    username VARCHAR(128) UNIQUE NOT NULL,
-    password_hash VARCHAR(256),
-    role VARCHAR(32) DEFAULT 'USER',
-    is_active BOOLEAN DEFAULT true,
-    created_at BIGINT NOT NULL,
-    last_login_at BIGINT DEFAULT 0
-);
-
--- Create anonymous user
-INSERT INTO User (id, username, role, created_at) 
-VALUES (0, 'anonymous', 'GUEST', CURRENT_TIMESTAMP);
-```
-
-**Step 2: Create User-Scoped Tables**
-```sql
--- M00XX_AddUserMangaLibrary.kt
-CREATE TABLE UserMangaLibrary (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES User(id),
-    manga_id INTEGER NOT NULL REFERENCES Manga(id),
-    added_at BIGINT NOT NULL,
-    custom_title VARCHAR(512),
-    is_favorite BOOLEAN DEFAULT false,
-    UNIQUE(user_id, manga_id)
-);
-
--- M00XX_AddUserChapter.kt
-CREATE TABLE UserChapter (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES User(id),
-    chapter_id INTEGER NOT NULL REFERENCES Chapter(id),
-    is_read BOOLEAN DEFAULT false,
-    is_bookmarked BOOLEAN DEFAULT false,
-    last_page_read INTEGER DEFAULT 0,
-    last_read_at BIGINT DEFAULT 0,
-    UNIQUE(user_id, chapter_id)
-);
-```
-
-**Step 3: Migrate Existing Data**
-```sql
--- M00XX_MigrateLibraryToUserLibrary.kt
--- Migrate all manga marked as in_library to anonymous user
-INSERT INTO UserMangaLibrary (user_id, manga_id, added_at)
-SELECT 0, id, in_library_at
-FROM Manga
-WHERE in_library = true;
-
--- M00XX_MigrateChapterProgress.kt
--- Migrate all chapter progress to anonymous user
-INSERT INTO UserChapter (user_id, chapter_id, is_read, is_bookmarked, last_page_read, last_read_at)
-SELECT 0, id, read, bookmark, last_page_read, last_read_at
-FROM Chapter
-WHERE read = true OR bookmark = true OR last_page_read > 0;
-```
-
-**Step 4: Update Categories**
-```sql
--- M00XX_AddUserToCategory.kt
-ALTER TABLE Category ADD COLUMN user_id INTEGER REFERENCES User(id);
-
--- Migrate existing categories to anonymous user
-UPDATE Category SET user_id = 0;
-```
-
-### 10.2 Application Migration
-
-**Config-Based Feature Toggle:**
-
-```kotlin
-object MultiUserMigration {
-    private val config = serverConfig
-    
-    fun isMultiUserEnabled(): Boolean = 
-        config.multiUserEnabled.value
-    
-    fun getUserIdForContext(ctx: Context): Int {
-        if (!isMultiUserEnabled()) {
-            return 1 // Legacy behavior
-        }
-        
-        val userType = getUserFromContext(ctx)
-        return when (userType) {
-            is UserType.Admin -> userType.id
-            is UserType.User -> userType.id
-            UserType.Anonymous -> 0
-            else -> 0 // Default to anonymous
-        }
-    }
-}
-```
-
-### 10.3 Rollback Plan
-
-**If Migration Fails:**
-
-1. Keep old columns/tables intact
-2. Feature flag to disable multi-user mode
-3. Fallback queries that use old schema
-4. Database backup before migration
-5. Migration verification scripts
-
-**Rollback Steps:**
-```kotlin
-object MigrationRollback {
-    fun rollbackToSingleUser() {
-        transaction {
-            // Merge all user libraries back to global
-            exec("UPDATE Manga SET in_library = true WHERE id IN (SELECT manga_id FROM UserMangaLibrary)")
-            
-            // Merge all reading progress back
-            exec("""
-                UPDATE Chapter 
-                SET read = true 
-                WHERE id IN (SELECT chapter_id FROM UserChapter WHERE is_read = true)
-            """)
-            
-            // Clear multi-user tables (optional)
-            // exec("DELETE FROM UserMangaLibrary")
-            // exec("DELETE FROM UserChapter")
-        }
-    }
-}
-```
-
----
-
-## 11. Testing Strategy
+## 10. Testing Strategy
 
 ### 11.1 Unit Tests
 
@@ -991,140 +829,7 @@ object MigrationRollback {
 
 ---
 
-## 12. Performance Considerations
-
-### 12.1 Database Indexing
-
-**Required Indexes:**
-
-```sql
--- User table
-CREATE INDEX idx_user_username ON User(username);
-CREATE INDEX idx_user_role ON User(role);
-
--- UserMangaLibrary
-CREATE INDEX idx_user_manga_library_user ON UserMangaLibrary(user_id);
-CREATE INDEX idx_user_manga_library_manga ON UserMangaLibrary(manga_id);
-CREATE INDEX idx_user_manga_library_added ON UserMangaLibrary(user_id, added_at);
-
--- UserChapter
-CREATE INDEX idx_user_chapter_user ON UserChapter(user_id);
-CREATE INDEX idx_user_chapter_chapter ON UserChapter(chapter_id);
-CREATE INDEX idx_user_chapter_read ON UserChapter(user_id, is_read);
-CREATE INDEX idx_user_chapter_bookmarked ON UserChapter(user_id, is_bookmarked);
-
--- Category
-CREATE INDEX idx_category_user ON Category(user_id);
-CREATE INDEX idx_category_user_order ON Category(user_id, sort_order);
-
--- UserCategoryManga
-CREATE INDEX idx_user_category_manga_user ON UserCategoryManga(user_id);
-CREATE INDEX idx_user_category_manga_category ON UserCategoryManga(category_id);
-```
-
-### 12.2 Query Optimization
-
-**Common Query Patterns:**
-
-```kotlin
-// Efficient library query
-fun getUserLibrary(userId: Int): List<Manga> {
-    return transaction {
-        (MangaTable innerJoin UserMangaLibraryTable)
-            .select(MangaTable.columns)
-            .where { UserMangaLibraryTable.user eq userId }
-            .orderBy(UserMangaLibraryTable.addedAt to SortOrder.DESC)
-            .map { MangaTable.toDataClass(it) }
-    }
-}
-
-// Efficient chapter progress query
-fun getChapterProgress(userId: Int, mangaId: Int): List<UserChapterProgress> {
-    return transaction {
-        (ChapterTable innerJoin UserChapterTable)
-            .select(ChapterTable.columns + UserChapterTable.columns)
-            .where { 
-                (ChapterTable.manga eq mangaId) and 
-                (UserChapterTable.user eq userId) 
-            }
-            .map { row ->
-                UserChapterProgress(
-                    chapter = ChapterTable.toDataClass(row),
-                    isRead = row[UserChapterTable.isRead],
-                    isBookmarked = row[UserChapterTable.isBookmarked],
-                    lastPageRead = row[UserChapterTable.lastPageRead]
-                )
-            }
-    }
-}
-```
-
-### 12.3 Caching Strategy
-
-**Cache Layers:**
-
-1. **User Session Cache:**
-   - Cache user object for session duration
-   - Invalidate on logout or profile update
-   - TTL: Session lifetime
-
-2. **Library Cache:**
-   - Cache user library manga IDs
-   - Invalidate on library add/remove
-   - TTL: 5 minutes
-
-3. **Reading Progress Cache:**
-   - Cache recently accessed chapter progress
-   - Write-through cache for updates
-   - TTL: 1 minute
-
-**Implementation:**
-
-```kotlin
-object UserCache {
-    private val userLibraryCache = CacheBuilder.newBuilder()
-        .expireAfterWrite(5, TimeUnit.MINUTES)
-        .maximumSize(1000)
-        .build<Int, Set<Int>>() // userId -> Set of mangaIds
-    
-    fun getUserLibraryMangaIds(userId: Int): Set<Int> {
-        return userLibraryCache.get(userId) {
-            transaction {
-                UserMangaLibraryTable
-                    .select(UserMangaLibraryTable.manga)
-                    .where { UserMangaLibraryTable.user eq userId }
-                    .map { it[UserMangaLibraryTable.manga].value }
-                    .toSet()
-            }
-        }
-    }
-    
-    fun invalidateUserLibrary(userId: Int) {
-        userLibraryCache.invalidate(userId)
-    }
-}
-```
-
-### 12.4 Scalability Considerations
-
-**Vertical Scaling:**
-- Database connection pool sizing
-- Memory allocation for caches
-- Thread pool configuration
-
-**Horizontal Scaling Challenges:**
-- Session state management (use Redis or database sessions)
-- Cache synchronization across instances
-- Distributed locking for concurrent operations
-
-**Database Sharding (Future):**
-- Shard by user ID
-- Manga metadata in shared database
-- User data in user-specific shards
-
----
-
-## 13. Security Considerations
+## 11. Security Considerations
 
 ### 13.1 Authentication Security
 
@@ -1230,149 +935,60 @@ object SecurityAudit {
 
 ---
 
-## 14. Future Enhancements
+## 12. Open Questions
 
-### 14.1 Phase 2+ Features
+### 12.1 Design Decisions Needed
 
-**User Profile Enhancements:**
-- Profile pictures/avatars
-- Custom themes per user
-- Reading statistics and analytics
-- Reading goals and achievements
+1. **First-Run Setup UX:**
+   - Q: Should the setup wizard be required or optional?
+   - Recommendation: Required for security - force admin user creation on first launch
 
-**Social Features:**
-- Follow other users
-- Share reading lists
-- Recommendations based on similar users
-- Comments and reviews
-
-**Advanced Permissions:**
-- Fine-grained permissions (read-only access to specific categories)
-- Shared libraries (family sharing)
-- Guest passes with expiration
-- API tokens for third-party clients
-
-**Integration Enhancements:**
-- OAuth2/SAML for enterprise SSO
-- LDAP/Active Directory integration
-- Social login (Google, GitHub, etc.)
-- Two-factor authentication (2FA)
-
-### 14.2 API Enhancements
-
-**GraphQL Subscriptions:**
-- Real-time library updates
-- Live reading progress sync
-- Notification system
-
-**Batch Operations:**
-- Bulk add to library
-- Bulk mark as read
-- Batch category assignment
-
-**Advanced Filtering:**
-- Search across all users (admin)
-- Complex library queries
-- Custom sorting and grouping
-
-### 14.3 Mobile App Support
-
-**Offline Sync:**
-- Download user library for offline access
-- Sync reading progress when online
-- Conflict resolution
-
-**Push Notifications:**
-- New chapter notifications (per user)
-- Library update notifications
-- Tracking updates from external services
-
-### 14.4 Performance Enhancements
-
-**Advanced Caching:**
-- CDN for manga images
-- Pre-computed library views
-- Background job for cache warming
-
-**Database Optimization:**
-- Read replicas for scaling
-- Database partitioning
-- Archive old data
-
----
-
-## 15. Open Questions
-
-### 15.1 Design Decisions Needed
-
-1. **Default User Behavior:**
-   - Q: Should new installations create a default admin user or require setup?
-   - Options: A) Auto-create admin, B) Require first-run setup, C) Continue with anonymous
-   - Recommendation: Require first-run setup for security
-
-2. **Anonymous Library Access:**
-   - Q: Should anonymous library be read-only or read-write?
-   - Options: A) Read-only, B) Read-write with limitations, C) Configurable
-   - Recommendation: Configurable via server config
-
-3. **Migration Timing:**
+2. **Migration Timing:**
    - Q: When should migration happen - automatic on upgrade or manual trigger?
-   - Options: A) Automatic, B) Manual with prompt, C) Delayed until multi-user enabled
-   - Recommendation: Automatic with verification, rollback option
+   - Options: A) Automatic on first launch, B) Manual trigger from admin panel
+   - Recommendation: Automatic on first launch with clear progress indication
 
-4. **Shared Resources:**
+3. **Shared Resources:**
    - Q: Should manga metadata (descriptions, thumbnails) be shared or per-user?
    - Decision: Shared (to save storage and bandwidth)
 
-5. **Category Limits:**
+4. **Category Limits:**
    - Q: Should there be a limit on categories per user?
    - Options: A) Unlimited, B) Soft limit (warn at 50), C) Hard limit
    - Recommendation: Soft limit with warning
 
-### 15.2 Technical Concerns
+### 12.2 Technical Concerns
 
-1. **Performance Impact:**
-   - Q: What is acceptable performance degradation for multi-user mode?
-   - Target: < 10% overhead for single-user deployments
-   - Need: Benchmarking before and after
-
-2. **Database Size:**
+1. **Database Size:**
    - Q: How much additional storage for multi-user data?
    - Estimate: 100-200 bytes per library entry, 50 bytes per chapter progress
-   - For 100 users with 1000 manga each and 50,000 chapters: ~50-100MB
+   - For 10 users with 1000 manga each: ~1-2MB additional
 
-3. **Concurrent Access:**
+2. **Concurrent Access:**
    - Q: How many concurrent users should be supported?
-   - Target: 100 concurrent users on recommended hardware
+   - Target: 10-20 concurrent users on recommended hardware
    - Need: Load testing to verify
 
-### 15.3 User Experience
+### 12.3 User Experience
 
-1. **Migration UX:**
-   - Q: How to inform users about migration?
-   - Options: A) Automatic with notification, B) Require confirmation, C) Opt-in
-   - Recommendation: Automatic with notification and ability to rollback
-
-2. **Admin Interface:**
+1. **Admin Interface:**
    - Q: Should user management be in WebUI or API only?
-   - Recommendation: Both - API first, then WebUI in later phase
+   - Recommendation: Both - API first, then WebUI in Phase 2
 
-3. **User Registration:**
+2. **User Registration:**
    - Q: Should users self-register or admin-created only?
-   - Options: A) Admin-only, B) Self-registration with approval, C) Self-registration open
-   - Recommendation: Configurable, default to admin-only
+   - Decision: Admin-only for simplicity (self-registration can be added later)
 
-### 15.4 Compatibility
+### 12.4 Compatibility
 
 1. **Client Apps:**
    - Q: Will existing client apps work with multi-user server?
-   - Answer: Yes, with backward compatibility mode
+   - Answer: Apps will need updates to support authentication flows
    - Action: Document required changes for client app developers
 
 2. **Backup/Restore:**
    - Q: How to handle backups with multiple users?
-   - Options: A) Full backup (all users), B) Per-user backup, C) Both
-   - Recommendation: Both options available
+   - Recommendation: Full backup (all users) - per-user backup can be added later
 
 3. **External Trackers:**
    - Q: How to handle tracker credentials with multiple users?
@@ -1382,26 +998,23 @@ object SecurityAudit {
 
 ## Conclusion
 
-This planning document provides a comprehensive roadmap for implementing multi-user support in Suwayomi-Server. The implementation is designed to:
+This planning document provides a focused roadmap for implementing multi-user support in Suwayomi-Server. The implementation is designed to:
 
-1. **Maintain Backward Compatibility:** Existing installations continue to work seamlessly
-2. **Provide Clear Migration Path:** Step-by-step migration with rollback capability
+1. **Minimize Modifications:** Reuse existing authentication and add minimal new tables
+2. **Provide Clear Migration Path:** Simple first-run setup with automatic data migration
 3. **Ensure Data Isolation:** Each user's library, progress, and preferences are private
-4. **Support Anonymous Access:** Public/shared library for unauthenticated users
-5. **Scale Gracefully:** Performance optimization and caching strategies
+4. **Keep It Simple:** Focus on core functionality, avoid complex edge cases
 
 **Next Steps:**
 
 1. Review and approve this design document
 2. Create detailed technical specifications for Phase 1
-3. Set up development environment and testing infrastructure
-4. Begin implementation of Phase 1 (Foundation)
-5. Regular progress reviews and adjustments
+3. Begin implementation of Phase 1 (Foundation)
+4. Regular progress reviews and adjustments
 
 **Contributors:**
 - Community feedback welcome via GitHub issues
 - Technical design review needed before implementation
-- UI/UX input needed for admin interface
 
 **References:**
 - Issue #623: Multi-user support request
